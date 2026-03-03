@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>실시간 조직도</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&display=swap');
+        :root {
+            --bg: #0f0f13; --surface: #1a1a24; --border: #2e2e40;
+            --accent: #6c63ff; --text: #e8e8f0; --muted: #6b6b80;
+            --node-w: 130px; --node-h: 72px; --gap-x: 40px; --gap-y: 80px;
+        }
+        body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; overflow: auto; }
+        h1 { font-size: 18px; padding: 20px; color: var(--muted); text-align: center; }
+        #canvas-wrap { width: 100%; overflow: auto; padding-bottom: 100px; }
+        #chart { position: relative; display: inline-block; min-width: 100%; margin-top: 20px; }
+        .node {
+            position: absolute; width: var(--node-w); height: var(--node-h);
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 10px; padding: 10px; text-align: left; box-sizing: border-box; z-index: 2;
+        }
+        .node.root { border-color: var(--accent); box-shadow: 0 0 15px rgba(108,99,255,0.3); }
+        .node-id { font-size: 9px; color: var(--accent); margin-bottom: 2px; text-overflow: ellipsis; overflow: hidden; }
+        .node-title { font-size: 12px; font-weight: 600; color: var(--text); }
+        .node-pv { font-size: 10px; color: var(--muted); margin-top: 5px; }
+        svg.lines { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+        #more-btn { position: fixed; bottom: 20px; right: 20px; padding: 10px 20px; background: var(--accent); color: white; border: none; border-radius: 5px; cursor: pointer; z-index: 100; font-weight: bold; }
+        #status { text-align: center; margin-top: 50px; color: var(--accent); }
+    </style>
+</head>
+<body>
+
+    <h1>Organization Chart</h1>
+    <div id="canvas-wrap">
+        <div id="chart">
+            <svg class="lines" id="svg-lines"></svg>
+            <p id="status">데이터를 불러오는 중...</p>
+        </div>
+    </div>
+
+    <script src="https://www.gstatic.com/firebasejs/9.15.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.15.0/firebase-firestore-compat.js"></script>
+
+    <script>
+        const firebaseConfig = {
+            apiKey: "본인의_API_KEY",
+            authDomain: "mlmtest-578af.firebaseapp.com",
+            projectId: "mlmtest-578af",
+            storageBucket: "mlmtest-578af.appspot.com",
+            messagingSenderId: "본인의_SENDER_ID",
+            appId: "본인의_APP_ID"
+        };
+
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+
+        let allNodes = [];
+        let currentLimit = 10;
+        let positions = {};
+        const NODE_W = 130, NODE_H = 72, GAP_X = 40, GAP_Y = 80;
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const myId = urlParams.get('ID') || 'company';
+
+        // 1. 데이터 감시
+        db.collection("TREE").onSnapshot((snapshot) => {
+            allNodes = [];
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                allNodes.push({
+                    id: data.ID || doc.id,
+                    title: data.TITLE || "Member",
+                    pv: data.PV || 0,
+                    parentId: data.PARENT_ID || null,
+                    position: data.POSITION || null
+                });
+            });
+            startRender();
+        });
+
+        // 2. ✅ visited Set으로 순환 참조 완전 차단
+        function getSubtree(rootId, list, depth, visited) {
+            if (depth >= currentLimit) return [];
+            if (visited.has(rootId)) return [];   // 이미 방문 → 즉시 중단
+            visited.add(rootId);
+
+            const rootNode = list.find(n => n.id === rootId);
+            if (!rootNode) return [];
+
+            let res = [{ ...rootNode, parentId: depth === 0 ? null : rootNode.parentId }];
+            const children = list.filter(n => n.parentId === rootId && n.id !== rootId);
+
+            children.forEach(c => {
+                res = res.concat(getSubtree(c.id, list, depth + 1, visited));
+            });
+            return res;
+        }
+
+        // 3. 트리 맵 구성
+        function buildTreeMap(nodes) {
+            const map = {};
+            nodes.forEach(n => map[n.id] = { ...n, left: null, right: null });
+            nodes.forEach(n => {
+                if (n.parentId && map[n.parentId]) {
+                    if (n.position === 'L') map[n.parentId].left = n.id;
+                    else if (n.position === 'R') map[n.parentId].right = n.id;
+                }
+            });
+            return map;
+        }
+
+        // ✅ Math.max(NODE_W, ...) 로 노드 겹침 방지
+        function getWidth(id, map) {
+            if (!id || !map[id]) return 0;
+            const lw = getWidth(map[id].left, map);
+            const rw = getWidth(map[id].right, map);
+            if (!map[id].left && !map[id].right) return NODE_W;
+            const childW = lw + (lw && rw ? GAP_X : 0) + rw;
+            return Math.max(NODE_W, childW);
+        }
+
+        // ✅ right child가 left 없을 때 겹치는 문제 수정
+        function setCoordinates(id, map, x, y) {
+            if (!id || !map[id]) return;
+            const lw = getWidth(map[id].left, map);
+            const rw = getWidth(map[id].right, map);
+            const totalW = lw + (lw && rw ? GAP_X : 0) + rw;
+            const nodeX = totalW > NODE_W ? x + (totalW - NODE_W) / 2 : x;
+            positions[id] = { x: nodeX, y };
+
+            const childY = y + NODE_H + GAP_Y;
+            if (map[id].left)  setCoordinates(map[id].left,  map, x, childY);
+            if (map[id].right) setCoordinates(map[id].right, map, x + lw + (lw ? GAP_X : 0), childY);
+        }
+
+        // 4. 렌더링
+        function startRender() {
+            const chart = document.getElementById('chart');
+            const svg = document.getElementById('svg-lines');
+            const status = document.getElementById('status');
+
+            chart.querySelectorAll('.node').forEach(n => n.remove());
+            svg.innerHTML = '';
+            positions = {};
+
+            // ✅ 매 렌더마다 새 visited Set 생성
+            const mySubtree = getSubtree(myId, allNodes, 0, new Set());
+
+            if (mySubtree.length === 0) {
+                status.innerText = "데이터가 없거나 ID가 틀립니다: " + myId;
+                status.style.display = 'block';
+                return;
+            }
+            status.style.display = 'none';
+
+            const map = buildTreeMap(mySubtree);
+            setCoordinates(myId, map, 0, 0);
+
+            let minX = Infinity, maxX = -Infinity, maxY = -Infinity;
+            Object.values(positions).forEach(p => {
+                minX = Math.min(minX, p.x);
+                maxX = Math.max(maxX, p.x + NODE_W);
+                maxY = Math.max(maxY, p.y + NODE_H);
+            });
+
+            chart.style.width  = (maxX - minX) + 'px';
+            chart.style.height = (maxY + 20) + 'px';
+
+            mySubtree.forEach(n => {
+                const pos = positions[n.id];
+                if (!pos) return;
+
+                const el = document.createElement('div');
+                el.className = 'node' + (n.id === myId ? ' root' : '');
+                el.style.left = (pos.x - minX) + 'px';
+                el.style.top  = pos.y + 'px';
+                el.innerHTML = `
+                    <div class="node-id">${n.id}</div>
+                    <div class="node-title">${n.title}</div>
+                    <div class="node-pv">PV ${Number(n.pv).toLocaleString()}</div>
+                `;
+                chart.appendChild(el);
+
+                if (n.parentId && positions[n.parentId]) {
+                    const f = positions[n.parentId];
+                    const x1 = (f.x - minX) + NODE_W / 2, y1 = f.y + NODE_H;
+                    const x2 = (pos.x - minX) + NODE_W / 2, y2 = pos.y;
+                    const mid = (y1 + y2) / 2;
+                    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    path.setAttribute('d', `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`);
+                    path.setAttribute('stroke', '#2e2e40');
+                    path.setAttribute('fill', 'none');
+                    path.setAttribute('stroke-width', '1.5');
+                    svg.appendChild(path);
+                }
+            });
+        }
+
+        // 5. 더보기 버튼
+        const btn = document.createElement('button');
+        btn.id = "more-btn";
+        btn.innerText = "더 보기 (" + currentLimit + "대)";
+        btn.onclick = () => {
+            if (currentLimit < 100) {
+                currentLimit += 10;
+                btn.innerText = "더 보기 (" + currentLimit + "대)";
+                startRender();
+            }
+        };
+        document.body.appendChild(btn);
+    </script>
+</body>
+</html>
